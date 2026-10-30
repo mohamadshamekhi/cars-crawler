@@ -37,10 +37,11 @@ class CarsApiClient:
             data = resp.json()
             return data["_id"]
 
-    async def send_listing(self, run_id: str, listing: Dict[str, Any], max_retries: int = 3, backoff_seconds: float = 2.0) -> None:
+    async def send_listing(self, run_id: str, listing: Dict[str, Any], max_retries: int = 3, backoff_seconds: float = 2.0) -> bool:
         """
         ارسال یک آگهی. در صورت 432 (رد قطعی، مثلاً اقساطی/قسطی/چکی) هیچ retry انجام نمی‌شود
         و آگهی نادیده گرفته می‌شود. در صورت 400 یا 5xx تا max_retries بار با backoff تلاش می‌شود.
+        خروجی: True اگر آگهی ثبت یا قطعاً رد (432) شد؛ False اگر بعد از همه‌ی تلاش‌ها ناموفق ماند.
         """
         payload = {"runId": run_id, **listing}
         for attempt in range(1, max_retries + 1):
@@ -49,21 +50,27 @@ class CarsApiClient:
 
             if resp.status_code == FINAL_REJECT_STATUS:
                 print(f"[~] آگهی قطعاً رد شد (432): {listing.get('source_url')}")
-                return
+                return True
 
             if resp.status_code == 400 or resp.status_code >= 500:
                 if attempt >= max_retries:
                     print(f"[✕] ارسال آگهی بعد از {attempt} تلاش ناموفق ماند (status={resp.status_code}): {listing.get('source_url')}")
-                    return
+                    return False
                 await asyncio.sleep(backoff_seconds * attempt)
                 continue
 
             resp.raise_for_status()
-            return
+            return True
+        return False
 
-    async def end_run(self, run_id: str) -> None:
+    async def end_run(self, run_id: str, exhaustive: bool = False) -> None:
+        """exhaustive=True فقط وقتی کل لیست تا انتها کرال و بی‌خطا ارسال شد؛ بک‌اند بر اساس آن آگهی‌های غایب را removed می‌کند"""
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{self.base_url}/crawl/runs/{run_id}/end", headers=self._headers())
+            resp = await client.post(
+                f"{self.base_url}/crawl/runs/{run_id}/end",
+                json={"exhaustive": exhaustive},
+                headers=self._headers(),
+            )
             resp.raise_for_status()
 
     async def mark_filters_supported(self, source: str, keys: list) -> None:

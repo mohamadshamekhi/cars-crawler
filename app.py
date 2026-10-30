@@ -25,8 +25,8 @@ app = FastAPI(title="Divar Car Crawler")
 class CrawlRequest(BaseModel):
     targetId: str
     source: str
-    brand: str
-    carModel: str
+    brand: Optional[str] = None
+    carModel: Optional[str] = None
     trim: Optional[str] = None
     carSlug: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
@@ -37,8 +37,15 @@ def _verify_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="کلید API نامعتبر است")
 
 
-def _build_car_slug(brand: str, car_model: str, trim: Optional[str]) -> str:
-    model_part = f"{car_model}-{trim}" if trim else car_model
+def _build_car_slug(brand: Optional[str], car_model: Optional[str], trim: Optional[str]) -> Optional[str]:
+    """None برای «همه‌ی خودروها»، فقط brand اگر مدل خالی است، وگرنه brand/model[-trim]"""
+    brand = (brand or "").strip().strip("/")
+    car_model = (car_model or "").strip().strip("/")
+    if not brand:
+        return None
+    if not car_model:
+        return brand
+    model_part = f"{car_model}-{trim.strip()}" if trim and trim.strip() else car_model
     return f"{brand}/{model_part}"
 
 
@@ -72,12 +79,13 @@ async def _run_crawl_job(payload: CrawlRequest):
 async def _run_crawl_job_unlocked(payload: CrawlRequest):
     client = CarsApiClient()
     run_id = None
+    exhaustive = False
     try:
         run_id = await client.start_run(
             target_id=payload.targetId,
             source=payload.source,
-            brand=payload.brand,
-            car_model=payload.carModel,
+            brand=payload.brand or "",
+            car_model=payload.carModel or "",
             trim=payload.trim or "",
         )
 
@@ -103,16 +111,17 @@ async def _run_crawl_job_unlocked(payload: CrawlRequest):
             vehicle_info = listing.get("vehicle_info") or {}
             if not vehicle_info.get("brand") or not vehicle_info.get("model"):
                 print(f"[~] آگهی بدون brand/model شناخته‌شده نادیده گرفته شد: {listing.get('source_url')}")
-                return
-            await client.send_listing(run_id, listing)
+                return True
+            return await client.send_listing(run_id, listing)
 
         await scraper.run(on_item=on_item)
+        exhaustive = scraper.exhaustive
     except Exception as e:
         print(f"[✕] اجرای کرال targetId={payload.targetId} با خطا متوقف شد: {e}")
     finally:
         if run_id:
             try:
-                await client.end_run(run_id)
+                await client.end_run(run_id, exhaustive=exhaustive)
             except Exception as e:
                 print(f"[✕] پایان‌دادن به run {run_id} با خطا مواجه شد: {e}")
 

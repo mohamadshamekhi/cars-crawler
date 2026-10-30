@@ -7,6 +7,9 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 
+SUGGESTION_CONTAINER_RE = re.compile(r'suggestions-row|keen-slider')
+
+
 class DivarCarScraper:
     def __init__(self, settings: Dict[str, Any]):
         self.base_url = settings.get("base_url")
@@ -20,6 +23,11 @@ class DivarCarScraper:
         self.country = settings.get("country", "iran")  # iran یا tehran
         # پارامترهای generic اضافی که مستقیم به query string دیوار اضافه می‌شوند (کلید=نام پارامتر دیوار)
         self.extra_query_params: Dict[str, str] = settings.get("extra_query_params", {}) or {}
+        # چند اسکرول پشت‌سرهم بدون لینک جدید = رسیدن به انتهای لیست
+        self.max_stale_scrolls = settings.get("max_stale_scrolls", 3)
+        # بعد از run: True فقط اگر کل لیست تا انتها اسکرول شد (نه سقف max_items) و همه‌ی آگهی‌ها بی‌خطا پردازش/ارسال شدند
+        self.reached_end = False
+        self.exhaustive = False
 
     async def _clean_number(self, text: Optional[str]) -> Optional[int]:
         """تبدیل دقیق اعداد فارسی/عربی به عدد صحیح"""
@@ -49,12 +57,11 @@ class DivarCarScraper:
 
     async def _build_base_url(self) -> str:
         """ساخت URL با فیلترهای کاربر: brand/model/slug، سال تولید، وضعیت بدنه"""
-        parts = []
-        country = self.country if self.country else "iran"
-        parts.append(country)
-        parts.append("car")
+        country = (self.country or "iran").strip("/") or "iran"
+        parts = [country, "car"]
+        # بخش‌های خالی slug حذف می‌شوند تا هرگز // در URL نیاید (هدف «همه‌ی خودروها» = بدون slug)
         if self.car_slug:
-            parts.append(self.car_slug)
+            parts.extend(seg for seg in str(self.car_slug).split("/") if seg.strip())
         base = f"https://divar.ir/s/{'/'.join(parts)}"
         qs = []
         if self.production_year:
@@ -76,24 +83,39 @@ class DivarCarScraper:
             self.base_url = await self._build_base_url()
         print(f"[+] در حال بارگذاری صفحه آگهی‌ها با فیلترها: {self.base_url} (سقف: {self.max_items} آیتم)...")
         await page.goto(self.base_url, wait_until="domcontentloaded")
-        
-        await page.evaluate("window.scrollBy(0, 1000)")
         await asyncio.sleep(self.delay_seconds)
 
-        content = await page.content()
-        soup = BeautifulSoup(content, 'html.parser')
-        
-        links = []
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag['href']
-            if '/v/' in href:
-                full_url = f"https://divar.ir{href}" if href.startswith('/') else href
-                if full_url not in links:
-                    links.append(full_url)
-                if len(links) >= self.max_items:
-                    break
+        # اسکرول تا رسیدن به سقف max_items یا انتهای لیست (لیست دیوار ممکن است کارت‌های قبلی را از DOM حذف کند، پس تجمعی جمع می‌شود)
+        links: List[str] = []
+        self.reached_end = False
+        stale = 0
+        while len(links) < self.max_items:
+            before = len(links)
+            soup = BeautifulSoup(await page.content(), 'html.parser')
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                # اسلایدر «آگهی‌های پیشنهادی در شهرهای اطراف» جزو نتایج جستجو نیست
+                if '/v/' in href and not a_tag.find_parent(class_=SUGGESTION_CONTAINER_RE):
+                    full_url = f"https://divar.ir{href}" if href.startswith('/') else href
+                    if full_url not in links:
+                        links.append(full_url)
+                    if len(links) >= self.max_items:
+                        break
+            if len(links) >= self.max_items:
+                break
 
-        print(f"[✓] تعداد {len(links)} لینک آگهی استخراج شد.")
+            stale = stale + 1 if len(links) == before else 0
+            if stale >= self.max_stale_scrolls:
+                self.reached_end = True
+                break
+
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            more = page.get_by_role("button", name=re.compile("آگهی‌های بیشتر|بیشتر"))
+            if await more.count() and await more.first.is_visible():
+                await more.first.click()
+            await asyncio.sleep(self.delay_seconds)
+
+        print(f"[✓] تعداد {len(links)} لینک آگهی استخراج شد{' (انتهای لیست)' if self.reached_end else ''}.")
         return links
 
     def _extract_image_urls(self, soup: BeautifulSoup, max_images: int = 20) -> List[str]:
@@ -298,8 +320,11 @@ class DivarCarScraper:
             print(f"[✕] خطایی در پردازش آگهی {url} رخ داد: {e}")
             return None
 
-    async def run(self, on_item: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None):
-        """اجرای کرال. اگر on_item داده شود، به ازای هر آگهی موفق فوراً صدا زده می‌شود (مثلاً برای ارسال تکی به cars-api)."""
+    async def run(self, on_item: Optional[Callable[[Dict[str, Any]], Awaitable[Optional[bool]]]] = None):
+        """اجرای کرال. اگر on_item داده شود، به ازای هر آگهی موفق فوراً صدا زده می‌شود (مثلاً برای ارسال تکی به cars-api).
+        on_item اگر False برگرداند یعنی آگهی ثبت نشد و run دیگر exhaustive حساب نمی‌شود."""
+        self.exhaustive = False
+        failures = 0
         async with async_playwright() as p:
             # داخل Docker: بدون sandbox (کاربر non-root بدون user namespace) و بدون اتکا به /dev/shm کوچک
             launch_kwargs: Dict[str, Any] = {
@@ -322,13 +347,18 @@ class DivarCarScraper:
                 scraped_data = []
                 for link in links:
                     car_info = await self.parse_car_details(page, link)
-                    if car_info:
-                        scraped_data.append(car_info)
-                        if on_item:
-                            try:
-                                await on_item(car_info)
-                            except Exception as e:
-                                print(f"[✕] خطا در ارسال/پردازش فوری آگهی {link}: {e}")
+                    if not car_info:
+                        failures += 1
+                        continue
+                    scraped_data.append(car_info)
+                    if on_item:
+                        try:
+                            if await on_item(car_info) is False:
+                                failures += 1
+                        except Exception as e:
+                            failures += 1
+                            print(f"[✕] خطا در ارسال/پردازش فوری آگهی {link}: {e}")
+                self.exhaustive = self.reached_end and failures == 0
             finally:
                 await browser.close()
 
