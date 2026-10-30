@@ -6,6 +6,7 @@ from typing import AsyncIterator, Awaitable, Callable, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
+from divar_description import extract_description
 from crawl_incremental import IncrementalTracker, RunNotRunningError, token_from_url
 
 
@@ -179,8 +180,13 @@ class DivarCarScraper:
             # اسکرول به پایین صفحه برای رندر کامل عناصر
             await page.evaluate("window.scrollBy(0, 1200)")
             
+            # تا رندر بخش توضیحات صبر کن (کلاس قدیمی یا عنوان «توضیحات»)
             try:
-                await page.wait_for_selector("p.kt-description-row__text", timeout=4000)
+                await (
+                    page.locator("p.kt-description-row__text")
+                    .or_(page.get_by_text("توضیحات", exact=True))
+                    .first.wait_for(timeout=4000)
+                )
             except PlaywrightTimeoutError:
                 pass
 
@@ -295,30 +301,10 @@ class DivarCarScraper:
             # ۷. استخراج لینک خام عکس‌ها از CDN دیوار (حداکثر ۲۰، بدون تکراری و بدون عکس نقشه)
             image_urls = self._extract_image_urls(soup)
 
-            # ۸. استخراج دقیق توضیحات آگهی
-            description = ""
-            # پیدا کردن پاراگراف اصلی آگهی (نه تاریخ انتشار که در محتوای جمع‌شونده است)
-            desc_p = None
-            for p in soup.find_all('p', class_=re.compile('kt-description-row__text')):
-                txt = p.get_text(strip=True)
-                if txt and 'انتشار آگهی' not in txt and 'آخرین به‌روز‌رسانی' not in txt:
-                    desc_p = p
-                    break
-            if desc_p:
-                description = desc_p.get_text(separator="\n", strip=True)
-            else:
-                desc_row = soup.find('div', class_=re.compile('kt-description-row'))
-                if desc_row:
-                    description = desc_row.get_text(separator="\n", strip=True)
-            # fallback: جمع‌آوری تمام متن‌های غیرتاریخ اگر هنوز خالی بود
-            if not description.strip():
-                candidates = []
-                for p in soup.find_all('p', class_=re.compile('kt-description-row__text')):
-                    txt = p.get_text(strip=True)
-                    if txt and 'انتشار آگهی' not in txt and 'آخرین به‌روز‌رسانی' not in txt:
-                        candidates.append(txt)
-                if candidates:
-                    description = "\n".join(candidates)
+            # ۸. توضیحات آگهی (چند راه مستقل از کلاس CSS؛ divar_description.py)
+            description = extract_description(soup)
+            if not description:
+                print(f"[!] توضیحات آگهی پیدا نشد: {url}")
 
             # تمیزکاری اعداد
             price_numeric = await self._clean_number(raw_price) if raw_price else None
