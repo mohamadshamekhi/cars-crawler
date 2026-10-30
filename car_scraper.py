@@ -6,7 +6,7 @@ from typing import AsyncIterator, Awaitable, Callable, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
-from divar_description import extract_description
+from divar_description import description_from_post_json, extract_description
 from crawl_incremental import IncrementalTracker, RunNotRunningError, token_from_url
 
 
@@ -172,6 +172,23 @@ class DivarCarScraper:
                 break
         return result
 
+    async def _description_from_api(self, page: Page, url: str) -> str:
+        """راه آخر: JSON همان آگهی از API وب دیوار با همان مرورگر (کوکی/IP)؛ خطا ⇒ رشته‌ی خالی."""
+        token = token_from_url(url)
+        if not token:
+            return ""
+        try:
+            response = await page.request.get(
+                f"https://api.divar.ir/v8/posts-v2/web/{token}", timeout=8000
+            )
+            if not response.ok:
+                print(f"[!] API توضیحات دیوار {response.status}: {url}")
+                return ""
+            return description_from_post_json(await response.json())
+        except Exception as e:  # شبکه/JSON — توضیحات اختیاری است، کرال ادامه پیدا می‌کند
+            print(f"[!] API توضیحات دیوار خطا داد ({e}): {url}")
+            return ""
+
     async def parse_car_details(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
         try:
             print(f"[→] در حال کرال آگهی: {url}")
@@ -303,6 +320,8 @@ class DivarCarScraper:
 
             # ۸. توضیحات آگهی (چند راه مستقل از کلاس CSS؛ divar_description.py)
             description = extract_description(soup)
+            if not description:
+                description = await self._description_from_api(page, url)
             if not description:
                 print(f"[!] توضیحات آگهی پیدا نشد: {url}")
 

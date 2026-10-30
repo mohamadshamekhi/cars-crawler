@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -6,7 +7,7 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from divar_description import extract_description  # noqa: E402
+from divar_description import description_from_post_json, extract_description  # noqa: E402
 
 
 def extract(html):
@@ -42,6 +43,26 @@ class DescriptionTest(unittest.TestCase):
         <div><a href="/s/car">خودرو سواری و وانت</a></div>
         <div><h2>گزارش آگهی</h2><p>متن دیگر</p></div>"""
         self.assertEqual(extract(html), "")
+
+    def test_embedded_state_widget(self):
+        # بدون هیچ HTML توضیحات؛ فقط state سرور در <script>
+        state = json.dumps({"post": {"sections": [{"widgets": [
+            {"widget_type": "TITLE_ROW", "data": {"text": "توضیحات"}},
+            {"widget_type": "DESCRIPTION_ROW", "data": {"text": DESCRIPTION, "has_divider": True}},
+        ]}]}}, ensure_ascii=False)
+        html = f"<html><body><h1>بی ام و</h1><script>window.__PRELOADED_STATE__ = {state};</script></body></html>"
+        self.assertEqual(extract(html), DESCRIPTION)
+
+    def test_embedded_state_inside_js_string(self):
+        inner = json.dumps({"data": {"text": DESCRIPTION}, "widget_type": "DESCRIPTION_ROW"}, ensure_ascii=False)
+        html = f"<script>window.s = JSON.parse({json.dumps(inner, ensure_ascii=False)});</script>"
+        self.assertEqual(extract(html), DESCRIPTION)
+
+    def test_post_api_json(self):
+        api = {"sections": [{"section_name": "DESCRIPTION", "widgets": [
+            {"widget_type": "DESCRIPTION_ROW", "data": {"text": "  " + DESCRIPTION + "\n"}}]}]}
+        self.assertEqual(description_from_post_json(api), DESCRIPTION)
+        self.assertEqual(description_from_post_json({"sections": []}), "")
 
     def test_json_ld_fallback(self):
         html = """<script type="application/ld+json">{"@type":"Car","name":"سمند","description":"بدون رنگ\\nبیمه تا آخر سال"}</script>"""

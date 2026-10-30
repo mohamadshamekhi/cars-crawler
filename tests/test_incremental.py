@@ -25,6 +25,11 @@ class PriceTest(unittest.TestCase):
         for v in [None, "", "توافقی", "0 تومان", 0, True]:
             self.assertIsNone(normalize_price(v), v)
 
+    def test_refresh_flag_reopens_a_known_listing(self):
+        t = IncrementalTracker([{"token": "a", "price": 100, "refresh": True}, {"token": "b", "price": 100}])
+        self.assertEqual(t.classify("a", "۱۰۰ تومان"), "changed")
+        self.assertEqual(t.classify("b", "۱۰۰ تومان"), "unchanged")
+
     def test_classify(self):
         t = IncrementalTracker([{"token": "a", "price": 100}, {"token": "b", "price": None}])
         self.assertEqual(t.classify("a", "۱۰۰ تومان"), "unchanged")
