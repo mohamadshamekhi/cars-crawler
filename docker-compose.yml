@@ -1,0 +1,40 @@
+name: khodroban-crawler
+
+services:
+  crawler:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        PLAYWRIGHT_DOWNLOAD_HOST: ${PLAYWRIGHT_DOWNLOAD_HOST:-}
+    image: khodroban-crawler:latest
+    env_file: .env
+    environment:
+      PORT: "8000"
+    # پورتی publish نمی‌شود؛ api از داخل شبکه‌ی khodroban با http://crawler:8000 صدا می‌زند
+    expose:
+      - "8000"
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - khodroban
+
+networks:
+  khodroban:
+    external: true

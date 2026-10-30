@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.production.example
 cars_raw_data.json
 cars_processed_data.json
 .DS_Store
