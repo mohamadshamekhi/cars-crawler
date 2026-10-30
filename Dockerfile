@@ -1,27 +1,29 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-trixie
 
-# آینه‌ی pip (مثلاً آینه‌ی داخلی ایران) و هاست دانلود مرورگر Playwright در صورت مسدود بودن CDN
+# آینه‌ی pip (مثلاً آینه‌ی داخلی ایران)
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG PIP_TRUSTED_HOST=
-ARG PLAYWRIGHT_DOWNLOAD_HOST=
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    CHROMIUM_EXECUTABLE=/usr/bin/chromium \
     PORT=8000
 
 WORKDIR /app
 
+# Chromium از apt دبیان (CDN پلی‌رایت از ایران 403 می‌دهد)؛ فونت فارسی برای رندر درست متن
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium fonts-vazirmatn fonts-liberation ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --index-url "$PIP_INDEX_URL" ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} -r requirements.txt \
-    && if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then export PLAYWRIGHT_DOWNLOAD_HOST; else unset PLAYWRIGHT_DOWNLOAD_HOST; fi \
-    && playwright install --with-deps --only-shell chromium \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+    && rm -rf /tmp/*
 
 RUN useradd --create-home --uid 10001 crawler \
-    && chown -R crawler:crawler /app /ms-playwright
+    && chown -R crawler:crawler /app
 
 COPY --chown=crawler:crawler *.py ./
 

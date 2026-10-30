@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 from typing import Awaitable, Callable, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
@@ -301,10 +302,14 @@ class DivarCarScraper:
         """اجرای کرال. اگر on_item داده شود، به ازای هر آگهی موفق فوراً صدا زده می‌شود (مثلاً برای ارسال تکی به cars-api)."""
         async with async_playwright() as p:
             # داخل Docker: بدون sandbox (کاربر non-root بدون user namespace) و بدون اتکا به /dev/shm کوچک
-            browser = await p.chromium.launch(
-                headless=self.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
+            launch_kwargs: Dict[str, Any] = {
+                "headless": self.headless,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            }
+            # داخل Docker از Chromium سیستم (apt) استفاده می‌شود؛ بدون این env همان مرورگر خود Playwright
+            if os.environ.get("CHROMIUM_EXECUTABLE"):
+                launch_kwargs["executable_path"] = os.environ["CHROMIUM_EXECUTABLE"]
+            browser = await p.chromium.launch(**launch_kwargs)
             try:
                 context: BrowserContext = await browser.new_context(
                     user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
