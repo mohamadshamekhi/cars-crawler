@@ -97,8 +97,16 @@ class DivarCarScraper:
         if not self.base_url or not self.base_url.startswith("https://"):
             self.base_url = await self._build_base_url()
         print(f"[+] در حال بارگذاری صفحه آگهی‌ها با فیلترها: {self.base_url} (سقف: {self.max_items} آیتم)...")
-        await page.goto(self.base_url, wait_until="domcontentloaded")
-        await asyncio.sleep(self.delay_seconds)
+        # دیوار گاهی (مثلاً بعد از درخواست‌های پشت‌سرهم) صفحه را بدون لیست رندر می‌کند؛ چند بار با مکث دوباره تلاش می‌شود
+        for attempt in range(3):
+            await page.goto(self.base_url, wait_until="domcontentloaded")
+            await asyncio.sleep(self.delay_seconds)
+            try:
+                await page.wait_for_selector("a[href*='/v/']", timeout=8000)
+                break
+            except PlaywrightTimeoutError:
+                print(f"[~] لیست آگهی‌ها رندر نشد (تلاش {attempt + 1}/3)")
+                await asyncio.sleep(5 * (attempt + 1))
 
         # اسکرول تا رسیدن به سقف max_items یا انتهای لیست (لیست دیوار ممکن است کارت‌های قبلی را از DOM حذف کند، پس تجمعی جمع می‌شود)
         seen_urls = set()
@@ -126,7 +134,10 @@ class DivarCarScraper:
 
             stale = stale + 1 if count == before else 0
             if stale >= self.max_stale_scrolls:
-                self.reached_end = True
+                # صفر کارت معمولاً یعنی لیست رندر نشده (محدودیت/خطای دیوار)، نه لیست خالی؛ پس «انتها» حساب نمی‌شود
+                self.reached_end = count > 0
+                if count == 0:
+                    print(f"[~] هیچ کارتی در صفحه‌ی لیست پیدا نشد (title={await page.title()!r})")
                 break
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
