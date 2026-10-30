@@ -2,7 +2,7 @@
 منطق خالص کرال incremental (بدون مرورگر/شبکه تا تست‌پذیر باشد).
 
 برای هر کارت لیست دیوار (token + قیمت کارت):
-- token جدید یا قیمت متفاوت/نامعلوم ⇒ باز کردن صفحه‌ی آگهی و ارسال snapshot کامل (شمارنده‌ی K صفر می‌شود)
+- token جدید، قیمت متفاوت/نامعلوم یا refresh=true از cars-api (مثلاً snapshot بدون توضیحات) ⇒ باز کردن صفحه‌ی آگهی و ارسال snapshot کامل (شمارنده‌ی K صفر می‌شود)
 - شناخته‌شده و بدون تغییر ⇒ token در batch «seen» جمع می‌شود و شمارنده‌ی K یکی بالا می‌رود
 - K کارت پشت‌سرهم شناخته‌شده و بدون تغییر ⇒ توقف زودهنگام (stoppedEarly)
 """
@@ -47,10 +47,14 @@ def chunk(items: List[str], size: int = SEEN_BATCH_MAX) -> Iterable[List[str]]:
 class IncrementalTracker:
     def __init__(self, known_items: Iterable[Dict[str, Any]], stop_after_known: int = DEFAULT_STOP_AFTER_KNOWN):
         self.known: Dict[str, Optional[int]] = {}
+        # آگهی‌هایی که cars-api می‌خواهد دوباره باز شوند (snapshot ناقص، مثلاً بدون توضیحات)
+        self.refresh: set = set()
         for item in known_items or []:
             token = item.get("token")
             if token:
                 self.known[str(token)] = normalize_price(item.get("price"))
+                if item.get("refresh"):
+                    self.refresh.add(str(token))
         self.stop_after_known = max(1, int(stop_after_known or DEFAULT_STOP_AFTER_KNOWN))
         self.consecutive_known = 0
         self.pending_seen: List[str] = []
@@ -60,6 +64,8 @@ class IncrementalTracker:
         """'new' | 'changed' | 'unchanged' (truncated: هر token خارج لیست جدید است)"""
         if token not in self.known:
             return "new"
+        if token in self.refresh:
+            return "changed"
         known_price = self.known[token]
         price = normalize_price(card_price)
         if price is None or known_price is None or price != known_price:
