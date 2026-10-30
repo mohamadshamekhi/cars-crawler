@@ -1,7 +1,9 @@
 import asyncio
 import os
 import httpx
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+from crawl_incremental import RunNotRunningError
 
 # کد رد قطعی آگهی اقساطی/مشکوک توسط cars-api؛ نهایی است، نباید retry شود
 FINAL_REJECT_STATUS = 432
@@ -23,7 +25,19 @@ class CarsApiClient:
     def _headers(self) -> Dict[str, str]:
         return {"x-api-key": self.api_key, "Content-Type": "application/json"}
 
-    async def start_run(self, target_id: str, source: str, brand: str, car_model: str, trim: str) -> str:
+    @staticmethod
+    def _raise_if_run_not_running(resp: httpx.Response) -> None:
+        """409 با code=run_not_running ⇒ ران تمام/timeout شده؛ کرال باید تمیز متوقف شود"""
+        if resp.status_code != 409:
+            return
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if isinstance(body, dict) and body.get("code") == "run_not_running":
+            raise RunNotRunningError(body.get("message") or "run_not_running")
+
+    async def start_run(self, target_id: str, source: str, brand: str, car_model: str, trim: str, mode: Optional[str] = None) -> str:
         payload = {
             "targetId": target_id,
             "source": source,
@@ -31,6 +45,9 @@ class CarsApiClient:
             "carModel": car_model,
             "trim": trim,
         }
+        # خالی ⇒ بک‌اند خودش mode را تعیین می‌کند
+        if mode:
+            payload["mode"] = mode
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self.base_url}/crawl/runs/start", json=payload, headers=self._headers())
             resp.raise_for_status()
@@ -48,6 +65,7 @@ class CarsApiClient:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(f"{self.base_url}/crawl/listings", json=payload, headers=self._headers())
 
+            self._raise_if_run_not_running(resp)
             if resp.status_code == FINAL_REJECT_STATUS:
                 print(f"[~] آگهی قطعاً رد شد (432): {listing.get('source_url')}")
                 return True
@@ -63,14 +81,16 @@ class CarsApiClient:
             return True
         return False
 
-    async def end_run(self, run_id: str, exhaustive: bool = False) -> None:
-        """exhaustive=True فقط وقتی کل لیست تا انتها کرال و بی‌خطا ارسال شد؛ بک‌اند بر اساس آن آگهی‌های غایب را removed می‌کند"""
+    async def end_run(self, run_id: str, exhaustive: bool = False, stopped_early: bool = False) -> None:
+        """exhaustive=True فقط وقتی کل لیست تا انتها کرال و بی‌خطا ارسال شد؛ بک‌اند بر اساس آن آگهی‌های غایب را removed می‌کند.
+        stopped_early=True یعنی ران incremental بعد از K آگهی شناخته‌شده‌ی بدون تغییر متوقف شد."""
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.base_url}/crawl/runs/{run_id}/end",
-                json={"exhaustive": exhaustive},
+                json={"exhaustive": exhaustive, "stoppedEarly": stopped_early},
                 headers=self._headers(),
             )
+            self._raise_if_run_not_running(resp)
             resp.raise_for_status()
 
     async def mark_filters_supported(self, source: str, keys: list) -> None:
@@ -88,3 +108,22 @@ class CarsApiClient:
             resp = await client.get(f"{self.base_url}/crawl-sources/divar/filters", headers=self._headers())
             resp.raise_for_status()
             return resp.json()
+
+    async def get_known_listings(self, target_id: str, days: int = 14, limit: int = 5000) -> Dict[str, Any]:
+        """آگهی‌های اخیر هدف برای ران incremental: {targetId, count, truncated, items:[{token, price, lastSeenAt}]}"""
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"{self.base_url}/crawl/targets/{target_id}/known-listings",
+                params={"days": days, "limit": limit},
+                headers=self._headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def mark_seen(self, run_id: str, tokens: List[str]) -> List[str]:
+        """«هنوز هست» برای آگهی‌های بدون تغییر (≤۱۰۰۰ توکن)؛ خروجی: tokenهایی که بک‌اند نمی‌شناسد (باید کامل کرال شوند)"""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{self.base_url}/crawl/runs/{run_id}/seen", json={"tokens": tokens}, headers=self._headers())
+        self._raise_if_run_not_running(resp)
+        resp.raise_for_status()
+        return list(resp.json().get("unknown") or [])

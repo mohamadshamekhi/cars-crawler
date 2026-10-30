@@ -2,9 +2,11 @@ import asyncio
 import json
 import os
 import re
-from typing import Awaitable, Callable, Dict, Any, List, Optional
+from typing import AsyncIterator, Awaitable, Callable, Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
+
+from crawl_incremental import IncrementalTracker, RunNotRunningError, token_from_url
 
 
 SUGGESTION_CONTAINER_RE = re.compile(r'suggestions-row|keen-slider')
@@ -28,6 +30,7 @@ class DivarCarScraper:
         # بعد از run: True فقط اگر کل لیست تا انتها اسکرول شد (نه سقف max_items) و همه‌ی آگهی‌ها بی‌خطا پردازش/ارسال شدند
         self.reached_end = False
         self.exhaustive = False
+        self.stopped_early = False
 
     async def _clean_number(self, text: Optional[str]) -> Optional[int]:
         """تبدیل دقیق اعداد فارسی/عربی به عدد صحیح"""
@@ -78,7 +81,19 @@ class DivarCarScraper:
             base += "?" + "&".join(qs)
         return base
 
-    async def fetch_card_links(self, page: Page) -> List[str]:
+    @staticmethod
+    def _card_price_text(a_tag) -> Optional[str]:
+        """متن قیمت روی کارت لیست (مثل «۳,۰۵۰,۰۰۰,۰۰۰ تومان»)؛ توافقی/ناموجود ⇒ None"""
+        card = a_tag.find_parent('article') or a_tag
+        for desc in reversed(card.find_all(class_=re.compile('kt-post-card__description'))):
+            txt = desc.get_text(strip=True)
+            if 'تومان' in txt:
+                return txt
+        return None
+
+    async def iter_cards(self, page: Page) -> AsyncIterator[Dict[str, Any]]:
+        """کارت‌های نتایج را به ترتیب لیست برمی‌گرداند: {url, token, card_price}.
+        تا سقف max_items یا انتهای لیست اسکرول می‌کند؛ رسیدن به انتها در self.reached_end ثبت می‌شود."""
         if not self.base_url or not self.base_url.startswith("https://"):
             self.base_url = await self._build_base_url()
         print(f"[+] در حال بارگذاری صفحه آگهی‌ها با فیلترها: {self.base_url} (سقف: {self.max_items} آیتم)...")
@@ -86,25 +101,30 @@ class DivarCarScraper:
         await asyncio.sleep(self.delay_seconds)
 
         # اسکرول تا رسیدن به سقف max_items یا انتهای لیست (لیست دیوار ممکن است کارت‌های قبلی را از DOM حذف کند، پس تجمعی جمع می‌شود)
-        links: List[str] = []
+        seen_urls = set()
+        count = 0
         self.reached_end = False
         stale = 0
-        while len(links) < self.max_items:
-            before = len(links)
+        while count < self.max_items:
+            before = count
             soup = BeautifulSoup(await page.content(), 'html.parser')
             for a_tag in soup.find_all('a', href=True):
                 href = a_tag['href']
                 # اسلایدر «آگهی‌های پیشنهادی در شهرهای اطراف» جزو نتایج جستجو نیست
-                if '/v/' in href and not a_tag.find_parent(class_=SUGGESTION_CONTAINER_RE):
-                    full_url = f"https://divar.ir{href}" if href.startswith('/') else href
-                    if full_url not in links:
-                        links.append(full_url)
-                    if len(links) >= self.max_items:
-                        break
-            if len(links) >= self.max_items:
+                if '/v/' not in href or a_tag.find_parent(class_=SUGGESTION_CONTAINER_RE):
+                    continue
+                full_url = f"https://divar.ir{href}" if href.startswith('/') else href
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+                count += 1
+                yield {"url": full_url, "token": token_from_url(full_url), "card_price": self._card_price_text(a_tag)}
+                if count >= self.max_items:
+                    break
+            if count >= self.max_items:
                 break
 
-            stale = stale + 1 if len(links) == before else 0
+            stale = stale + 1 if count == before else 0
             if stale >= self.max_stale_scrolls:
                 self.reached_end = True
                 break
@@ -115,8 +135,10 @@ class DivarCarScraper:
                 await more.first.click()
             await asyncio.sleep(self.delay_seconds)
 
-        print(f"[✓] تعداد {len(links)} لینک آگهی استخراج شد{' (انتهای لیست)' if self.reached_end else ''}.")
-        return links
+        print(f"[✓] تعداد {count} کارت آگهی بررسی شد{' (انتهای لیست)' if self.reached_end else ''}.")
+
+    async def fetch_card_links(self, page: Page) -> List[str]:
+        return [card["url"] async for card in self.iter_cards(page)]
 
     def _extract_image_urls(self, soup: BeautifulSoup, max_images: int = 20) -> List[str]:
         """لینک خام عکس‌های آگهی روی CDN دیوار؛ تصویر نقشه و تکراری‌های thumbnail حذف می‌شوند"""
@@ -320,11 +342,59 @@ class DivarCarScraper:
             print(f"[✕] خطایی در پردازش آگهی {url} رخ داد: {e}")
             return None
 
-    async def run(self, on_item: Optional[Callable[[Dict[str, Any]], Awaitable[Optional[bool]]]] = None):
+    async def run(
+        self,
+        on_item: Optional[Callable[[Dict[str, Any]], Awaitable[Optional[bool]]]] = None,
+        tracker: Optional[IncrementalTracker] = None,
+        on_seen: Optional[Callable[[List[str]], Awaitable[List[str]]]] = None,
+    ):
         """اجرای کرال. اگر on_item داده شود، به ازای هر آگهی موفق فوراً صدا زده می‌شود (مثلاً برای ارسال تکی به cars-api).
-        on_item اگر False برگرداند یعنی آگهی ثبت نشد و run دیگر exhaustive حساب نمی‌شود."""
+        on_item اگر False برگرداند یعنی آگهی ثبت نشد و run دیگر exhaustive حساب نمی‌شود.
+        با tracker (حالت incremental) فقط آگهی‌های جدید/تغییرقیمت‌داده باز می‌شوند؛ بقیه با on_seen(tokens) اعلام
+        می‌شوند که tokenهای unknown را برمی‌گرداند تا آن‌ها هم کامل کرال شوند. RunNotRunningError کرال را تمیز متوقف می‌کند."""
         self.exhaustive = False
+        self.stopped_early = False
+        mode = "incremental" if tracker else "full"
         failures = 0
+        scraped_data: List[Dict[str, Any]] = []
+        url_by_token: Dict[str, str] = {}
+
+        async def crawl_one(page: Page, link: str):
+            nonlocal failures
+            car_info = await self.parse_car_details(page, link)
+            if not car_info:
+                failures += 1
+                return
+            scraped_data.append(car_info)
+            if on_item:
+                try:
+                    if await on_item(car_info) is False:
+                        failures += 1
+                except RunNotRunningError:
+                    raise
+                except Exception as e:
+                    failures += 1
+                    print(f"[✕] خطا در ارسال/پردازش فوری آگهی {link}: {e}")
+
+        async def flush_seen(page: Page, force: bool):
+            nonlocal failures
+            while True:
+                batch = tracker.take_seen_batch(force=force)
+                if not batch:
+                    return
+                try:
+                    unknown = await on_seen(batch) if on_seen else []
+                except RunNotRunningError:
+                    raise
+                except Exception as e:
+                    failures += 1
+                    print(f"[✕] ارسال seen ({len(batch)} توکن) با خطا مواجه شد: {e}")
+                    continue
+                tracker.stats["unknown"] += len(unknown)
+                for token in unknown:
+                    if token in url_by_token:
+                        await crawl_one(page, url_by_token[token])
+
         async with async_playwright() as p:
             # داخل Docker: بدون sandbox (کاربر non-root بدون user namespace) و بدون اتکا به /dev/shm کوچک
             launch_kwargs: Dict[str, Any] = {
@@ -342,28 +412,33 @@ class DivarCarScraper:
                 )
                 page = await context.new_page()
 
-                links = await self.fetch_card_links(page)
-
-                scraped_data = []
-                for link in links:
-                    car_info = await self.parse_car_details(page, link)
-                    if not car_info:
-                        failures += 1
-                        continue
-                    scraped_data.append(car_info)
-                    if on_item:
-                        try:
-                            if await on_item(car_info) is False:
-                                failures += 1
-                        except Exception as e:
-                            failures += 1
-                            print(f"[✕] خطا در ارسال/پردازش فوری آگهی {link}: {e}")
-                self.exhaustive = self.reached_end and failures == 0
+                if tracker is None:
+                    for link in await self.fetch_card_links(page):
+                        await crawl_one(page, link)
+                else:
+                    # صفحه‌ی لیست ثابت می‌ماند و آگهی‌ها در تب دوم باز می‌شوند تا اسکرول از دست نرود
+                    detail_page = await context.new_page()
+                    async for card in self.iter_cards(page):
+                        url_by_token[card["token"]] = card["url"]
+                        if tracker.observe(card["token"], card["card_price"]) != "unchanged":
+                            await crawl_one(detail_page, card["url"])
+                        else:
+                            await flush_seen(detail_page, force=False)
+                            if tracker.should_stop:
+                                self.stopped_early = True
+                                break
+                    await flush_seen(detail_page, force=True)
+                self.exhaustive = self.reached_end and not self.stopped_early and failures == 0
+            except RunNotRunningError as e:
+                print(f"[~] ران دیگر در حال اجرا نیست؛ کرال متوقف شد: {e}")
+                raise
             finally:
                 await browser.close()
+                with open("cars_raw_data.json", "w", encoding="utf-8") as f:
+                    json.dump(scraped_data, f, ensure_ascii=False, indent=2)
 
-            with open("cars_raw_data.json", "w", encoding="utf-8") as f:
-                json.dump(scraped_data, f, ensure_ascii=False, indent=2)
-
-            print(f"\n[★] کرال تمام شد. {len(scraped_data)} آگهی با موفقیت و اطلاعات بدون کلمات اضافی ذخیره شد.")
+            if tracker is not None:
+                print(f"[★] خلاصه‌ی ران: {tracker.summary(mode, self.stopped_early)} failures={failures}")
+            else:
+                print(f"[★] خلاصه‌ی ران: mode=full crawled={len(scraped_data)} failures={failures} exhaustive={self.exhaustive}")
             return scraped_data

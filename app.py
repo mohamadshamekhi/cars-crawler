@@ -8,11 +8,12 @@ load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from car_scraper import DivarCarScraper
 from cars_api_client import CarsApiClient
 from crawl_filters import apply_filters, FALLBACK_MULTI_SELECT_KEYS
+from crawl_incremental import DEFAULT_STOP_AFTER_KNOWN, IncrementalTracker, RunNotRunningError
 
 CRAWLER_API_KEY = os.environ.get("CRAWLER_API_KEY", "")
 # سقف مرورگرهای همزمان (هر کرال یک Chromium)؛ بقیه‌ی درخواست‌ها در صف می‌مانند تا RAM سرور پر نشود
@@ -30,6 +31,9 @@ class CrawlRequest(BaseModel):
     trim: Optional[str] = None
     carSlug: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
+    # incremental: فقط آگهی‌های جدید/تغییرقیمت‌داده باز می‌شوند؛ خالی ⇒ full (و بک‌اند خودش mode را تعیین می‌کند)
+    mode: Optional[Literal["full", "incremental"]] = None
+    stopAfterKnown: Optional[int] = DEFAULT_STOP_AFTER_KNOWN
 
 
 def _verify_api_key(x_api_key: Optional[str]):
@@ -80,13 +84,28 @@ async def _run_crawl_job_unlocked(payload: CrawlRequest):
     client = CarsApiClient()
     run_id = None
     exhaustive = False
+    stopped_early = False
+    run_alive = True
+    mode = payload.mode
+    tracker = None
     try:
+        if mode == "incremental":
+            try:
+                known = await client.get_known_listings(payload.targetId)
+                tracker = IncrementalTracker(known.get("items") or [], payload.stopAfterKnown or DEFAULT_STOP_AFTER_KNOWN)
+                print(f"[+] incremental: {known.get('count', len(tracker.known))} آگهی شناخته‌شده"
+                      f"{' (truncated)' if known.get('truncated') else ''}، توقف بعد از {tracker.stop_after_known} بدون تغییر")
+            except Exception as e:
+                print(f"[~] گرفتن known-listings ناموفق بود، ران به‌صورت full اجرا می‌شود: {e}")
+                mode = "full"
+
         run_id = await client.start_run(
             target_id=payload.targetId,
             source=payload.source,
             brand=payload.brand or "",
             car_model=payload.carModel or "",
             trim=payload.trim or "",
+            mode=mode,
         )
 
         scraper_settings = {
@@ -114,14 +133,23 @@ async def _run_crawl_job_unlocked(payload: CrawlRequest):
                 return True
             return await client.send_listing(run_id, listing)
 
-        await scraper.run(on_item=on_item)
+        async def on_seen(tokens: list):
+            return await client.mark_seen(run_id, tokens)
+
+        await scraper.run(on_item=on_item, tracker=tracker, on_seen=on_seen)
         exhaustive = scraper.exhaustive
+        stopped_early = scraper.stopped_early
+    except RunNotRunningError as e:
+        run_alive = False
+        print(f"[~] ران targetId={payload.targetId} در بک‌اند دیگر در حال اجرا نیست؛ کرال متوقف شد: {e}")
     except Exception as e:
         print(f"[✕] اجرای کرال targetId={payload.targetId} با خطا متوقف شد: {e}")
     finally:
-        if run_id:
+        if run_id and run_alive:
             try:
-                await client.end_run(run_id, exhaustive=exhaustive)
+                await client.end_run(run_id, exhaustive=exhaustive, stopped_early=stopped_early)
+            except RunNotRunningError:
+                print(f"[~] run {run_id} قبلاً تمام/timeout شده بود")
             except Exception as e:
                 print(f"[✕] پایان‌دادن به run {run_id} با خطا مواجه شد: {e}")
 
