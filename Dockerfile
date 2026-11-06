@@ -13,8 +13,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# آینه‌ی apt (دسترسی به deb.debian.org از سرور ایران ناپایدار است/تایم‌اوت می‌کند)
+ARG APT_MIRROR=http://mirror.arvancloud.ir/debian
+
 # Chromium از apt دبیان (CDN پلی‌رایت از ایران 403 می‌دهد)؛ فونت فارسی برای رندر درست متن
-RUN apt-get update \
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+        sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list 2>/dev/null; \
+    fi \
+    && apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=20 \
     && apt-get install -y --no-install-recommends chromium fonts-vazirmatn fonts-liberation ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
