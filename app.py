@@ -9,11 +9,13 @@ load_dotenv(os.environ.get("ENV_FILE", ".env"))
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Any, Dict, Literal, Optional
+from urllib.parse import urlparse
 
 from car_scraper import DivarCarScraper
 from cars_api_client import CarsApiClient
 from crawl_filters import apply_filters, FALLBACK_MULTI_SELECT_KEYS
 from crawl_incremental import DEFAULT_STOP_AFTER_KNOWN, IncrementalTracker, RunNotRunningError
+from new_car_prices import DEFAULT_SOURCE as NEW_CAR_PRICES_SOURCE, DEFAULT_URL as NEW_CAR_PRICES_URL, run_new_car_prices_job
 
 CRAWLER_API_KEY = os.environ.get("CRAWLER_API_KEY", "")
 # سقف مرورگرهای همزمان (هر کرال یک Chromium)؛ بقیه‌ی درخواست‌ها در صف می‌مانند تا RAM سرور پر نشود
@@ -159,3 +161,22 @@ async def crawl(payload: CrawlRequest, background_tasks: BackgroundTasks, x_api_
     _verify_api_key(x_api_key)
     background_tasks.add_task(_run_crawl_job, payload)
     return {"accepted": True, "targetId": payload.targetId}
+
+
+class NewCarPricesCrawlRequest(BaseModel):
+    runId: str
+    source: Literal["hamrah-mechanic"] = NEW_CAR_PRICES_SOURCE
+    url: str = NEW_CAR_PRICES_URL
+
+
+@app.post("/crawl/new-car-prices", status_code=202)
+async def crawl_new_car_prices(
+    payload: NewCarPricesCrawlRequest, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(default=None)
+):
+    # مستقل از _crawl_semaphore: یک درخواست HTTP سبک است و نباید پشت کرال‌های دیوار در صف بماند
+    _verify_api_key(x_api_key)
+    host = (urlparse(payload.url).hostname or "").lower()
+    if urlparse(payload.url).scheme not in ("http", "https") or not (host == "hamrah-mechanic.com" or host.endswith(".hamrah-mechanic.com")):
+        raise HTTPException(status_code=400, detail="url باید از دامنه‌ی hamrah-mechanic.com باشد")
+    background_tasks.add_task(run_new_car_prices_job, payload.runId, payload.url)
+    return {"accepted": True, "runId": payload.runId}
