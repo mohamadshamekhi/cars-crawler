@@ -127,3 +127,33 @@ class CarsApiClient:
         self._raise_if_run_not_running(resp)
         resp.raise_for_status()
         return list(resp.json().get("unknown") or [])
+
+    # --- قیمت خودروی صفر (همراه‌مکانیک) ---
+
+    async def start_new_car_prices_run(self, source: str = "hamrah-mechanic") -> str:
+        """فقط برای اجرای دستی؛ 409 run_already_running ⇒ HTTPStatusError"""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{self.base_url}/crawl/new-car-prices/runs/start", json={"source": source}, headers=self._headers())
+        resp.raise_for_status()
+        return resp.json()["runId"]
+
+    async def send_new_car_prices(self, run_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """یک batch (≤۵۰۰) ⇒ شمارش‌ها {received, created, changed, unchanged, skipped, matched, partial, unmatched, errors[]}"""
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{self.base_url}/crawl/new-car-prices/runs/{run_id}/items", json={"items": items}, headers=self._headers()
+            )
+        self._raise_if_run_not_running(resp)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def end_new_car_prices_run(self, run_id: str, status: str, total: Optional[int] = None, error: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {"status": status}
+        if total is not None:
+            payload["total"] = total
+        if error:
+            payload["error"] = error
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{self.base_url}/crawl/new-car-prices/runs/{run_id}/end", json=payload, headers=self._headers())
+        self._raise_if_run_not_running(resp)
+        resp.raise_for_status()

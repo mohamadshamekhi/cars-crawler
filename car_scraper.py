@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 from divar_description import description_from_post_json, extract_description
+from divar_location import extract_location
 from crawl_incremental import IncrementalTracker, RunNotRunningError, token_from_url
 
 
@@ -172,22 +173,24 @@ class DivarCarScraper:
                 break
         return result
 
-    async def _description_from_api(self, page: Page, url: str) -> str:
-        """راه آخر: JSON همان آگهی از API وب دیوار با همان مرورگر (کوکی/IP)؛ خطا ⇒ رشته‌ی خالی."""
+    async def _fetch_post_json(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
+        """راه آخر برای توضیحات/موقعیت مکانی: JSON همان آگهی از API وب دیوار با همان مرورگر
+        (کوکی/IP)؛ خطا یا نبود توکن ⇒ None. هم description_from_post_json و هم
+        location_from_post_json روی همین JSON کار می‌کنند، پس فقط یک بار واکشی می‌شود."""
         token = token_from_url(url)
         if not token:
-            return ""
+            return None
         try:
             response = await page.request.get(
                 f"https://api.divar.ir/v8/posts-v2/web/{token}", timeout=8000
             )
             if not response.ok:
-                print(f"[!] API توضیحات دیوار {response.status}: {url}")
-                return ""
-            return description_from_post_json(await response.json())
-        except Exception as e:  # شبکه/JSON — توضیحات اختیاری است، کرال ادامه پیدا می‌کند
-            print(f"[!] API توضیحات دیوار خطا داد ({e}): {url}")
-            return ""
+                print(f"[!] API آگهی دیوار {response.status}: {url}")
+                return None
+            return await response.json()
+        except Exception as e:  # شبکه/JSON — این داده اختیاری است، کرال ادامه پیدا می‌کند
+            print(f"[!] API آگهی دیوار خطا داد ({e}): {url}")
+            return None
 
     async def parse_car_details(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
         try:
@@ -320,10 +323,24 @@ class DivarCarScraper:
 
             # ۸. توضیحات آگهی (چند راه مستقل از کلاس CSS؛ divar_description.py)
             description = extract_description(soup)
+            post_json: Optional[Dict[str, Any]] = None
             if not description:
-                description = await self._description_from_api(page, url)
+                post_json = await self._fetch_post_json(page, url)
+                description = description_from_post_json(post_json) if post_json else ""
             if not description:
                 print(f"[!] توضیحات آگهی پیدا نشد: {url}")
+
+            # ۸.۵ شهر/استان آگهی (بهترین تلاش؛ divar_location.py). اگر از HTML پیدا نشد و
+            # هنوز JSON آگهی واکشی نشده (یعنی توضیحات از HTML پیدا شد)، همان API یک بار
+            # دیگر صدا زده می‌شود؛ نبودنش خطا محسوب نمی‌شود و فیلدهای مکان فقط حذف می‌شوند.
+            location_info = extract_location(soup)
+            if not location_info:
+                if post_json is None:
+                    post_json = await self._fetch_post_json(page, url)
+                if post_json:
+                    location_info = extract_location(soup, post_json)
+            if not location_info:
+                print(f"[~] شهر آگهی پیدا نشد (اختیاری): {url}")
 
             # تمیزکاری اعداد
             price_numeric = await self._clean_number(raw_price) if raw_price else None
@@ -351,6 +368,14 @@ class DivarCarScraper:
                 "image_urls": image_urls,
                 "crawled_at": asyncio.get_event_loop().time()
             }
+            # فیلدهای اختیاری مکان برای cars-api (cityDivarId دقیق‌تر؛ cityName fallback)؛
+            # نبودشان کلید را از payload حذف می‌کند، نه None (طبق قرارداد cars-api اختیاری است)
+            if location_info.get("city_divar_id"):
+                data["cityDivarId"] = location_info["city_divar_id"]
+            if location_info.get("province_divar_id"):
+                data["provinceDivarId"] = location_info["province_divar_id"]
+            if location_info.get("city_name"):
+                data["cityName"] = location_info["city_name"]
 
             return data
 

@@ -26,6 +26,7 @@ RUN useradd --create-home --uid 10001 crawler \
     && chown -R crawler:crawler /app
 
 COPY --chown=crawler:crawler *.py ./
+COPY --chown=crawler:crawler certs ./certs
 
 USER crawler
 
